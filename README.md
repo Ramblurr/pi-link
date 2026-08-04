@@ -142,9 +142,20 @@ Three tools: `link_send` to talk to another terminal, `link_list` to see who is 
 
 | Tool           | Behavior                                                | Returns                                                 |
 | -------------- | ------------------------------------------------------- | ------------------------------------------------------- |
+| `link_control` | Connect, rename, or disconnect this terminal | Immediate connection state |
 | `link_send`    | Send a message to one other terminal                    | Reports whether sending started, not whether it arrived |
 | `link_list`    | List currently connected terminals                      | Terminal list with roles, status, cwd, and context      |
 | `link_compact` | Ask another terminal to compact and wait for its result | Compacted, declined, or failed                          |
+
+### `link_control`
+
+Connect, rename, or disconnect the calling terminal. `connect` requires a name; `disconnect` closes the connection, cancels pending connection attempts, and disables auto-reconnect.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `action` | `"connect"` or `"disconnect"` | Connection action |
+| `name` | `string` | Required for `connect`; requested terminal name |
+
 
 ### `link_send`
 
