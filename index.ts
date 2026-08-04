@@ -18,6 +18,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Box, Text, type Component } from "@earendil-works/pi-tui";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import * as crypto from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
@@ -47,6 +48,7 @@ const PREVIEW_ROWS = 6;
 // Consumed by harnesses that hide extension tools by default (Oh My Pi);
 // ignored by Pi, whose ToolDefinition has no such field.
 const TOP_LEVEL_TOOL = { loadMode: "essential" } as const;
+const linkControlActions = ["connect", "disconnect"] as const;
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -1280,6 +1282,110 @@ export default function (pi: ExtensionAPI) {
     httpServer?.close();
   }
 
+  function setLinkName(args: string) {
+    let newName = normalizeName(args) ?? "";
+    if (!newName) {
+      const sessionName = normalizeName(pi.getSessionName());
+      if (sessionName) {
+        newName = sessionName;
+      } else {
+        return {
+          message: `Current name: "${terminalName}". No session name set. Usage: /link-name <name>`,
+          level: "info" as const,
+          error: "name_required",
+        };
+      }
+    }
+
+    if (newName === terminalName && newName === preferredName) {
+      return { message: `Already using "${newName}"`, level: "info" as const };
+    }
+
+    const savePreference = () => {
+      preferredName = newName;
+      pi.appendEntry("link-name", { name: preferredName });
+    };
+
+    if (newName === terminalName) {
+      savePreference();
+      return {
+        message: `Saved "${newName}" as preferred link name`,
+        level: "info" as const,
+      };
+    }
+
+    if (role === "hub") {
+      if (Array.from(hubClients.values()).includes(newName)) {
+        return {
+          message: `Name "${newName}" is already taken by another terminal`,
+          level: "warning" as const,
+          error: "name_taken",
+        };
+      }
+      const old = terminalName;
+      terminalName = newName;
+      const list = terminalList();
+      connectedTerminals = list;
+      updateStatus();
+      hubBroadcast(
+        { type: "terminal_left", name: old, terminals: list },
+        terminalName,
+      );
+      hubBroadcast(
+        {
+          type: "terminal_joined",
+          name: newName,
+          terminals: list,
+          cwd: currentCwd,
+          context: captureContext(),
+        },
+        terminalName,
+      );
+      pushStatus(true);
+      savePreference();
+      return { message: `Renamed to "${newName}"`, level: "info" as const };
+    }
+
+    savePreference();
+    if (role === "client") {
+      pendingClientRename = true;
+      ws?.close();
+      return {
+        message: `Reconnecting, requesting "${newName}" (hub may assign a different name if taken)...`,
+        level: "info" as const,
+      };
+    }
+
+    terminalName = newName;
+    return {
+      message: `Name set to "${newName}" (not connected)`,
+      level: "info" as const,
+    };
+  }
+
+  async function connectLink() {
+    if (role !== "disconnected") {
+      if (role === "client" && pendingClientRename) {
+        disconnect();
+      } else {
+        return `Already connected as "${terminalName}" (${role})`;
+      }
+    }
+    pi.appendEntry("link-active", { active: true });
+    manuallyDisconnected = false;
+    await initialize();
+    return role === "disconnected"
+      ? "Connection is being retried"
+      : `Connected as "${preferredName ?? terminalName}" (${role})`;
+  }
+
+  function disconnectLink() {
+    pi.appendEntry("link-active", { active: false });
+    manuallyDisconnected = true;
+    disconnect();
+    return "Disconnected from link";
+  }
+
   function scheduleReconnect() {
     if (disposed || manuallyDisconnected || reconnectTimer) return;
     const delay = RECONNECT_DELAY_MS + Math.random() * 3000;
@@ -1572,6 +1678,51 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     ...TOP_LEVEL_TOOL,
+    name: "link_control",
+    label: "Pi Link Control",
+    description:
+      "Connect this Pi terminal to the Pi Link hub under a required name, or disconnect it.",
+    promptSnippet:
+      "Connect this Pi terminal to Pi Link under a name, rename it, or disconnect it",
+    promptGuidelines: [
+      "Use link_control to connect, rename, or disconnect this Pi terminal; connect requires a name and reconnects under that name.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(linkControlActions, {
+        description: "Link action to perform",
+      }),
+      name: Type.Optional(
+        Type.String({
+          description: 'Terminal name; required when action is "connect"',
+        }),
+      ),
+    }),
+
+    async execute(_toolCallId, params) {
+      if (params.action === "disconnect") {
+        return textResult(disconnectLink(), { action: params.action });
+      }
+
+      const name = normalizeName(params.name);
+      if (!name) throw new Error('name is required when action is "connect"');
+
+      const named = setLinkName(name);
+      if ("error" in named) {
+        return textResult(named.message, {
+          action: params.action,
+          error: named.error,
+        });
+      }
+
+      return textResult(await connectLink(), {
+        action: params.action,
+        name: preferredName ?? terminalName,
+      });
+    },
+  });
+
+  pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "link_send",
     label: "Link Send",
     description: [
@@ -1859,118 +2010,22 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("link-name", {
     description: "Change link name. No arg = use session name",
     handler: async (args, _ctx) => {
-      let newName = normalizeName(args) ?? "";
-      if (!newName) {
-        // No argument: use session name if available
-        const sessionName = normalizeName(pi.getSessionName());
-        if (sessionName) {
-          newName = sessionName;
-        } else {
-          _ctx.ui.notify(
-            `Current name: "${terminalName}". No session name set. Usage: /link-name <name>`,
-            "info",
-          );
-          return;
-        }
-      }
-
-      if (newName === terminalName && newName === preferredName) {
-        _ctx.ui.notify(`Already using "${newName}"`, "info");
-        return;
-      }
-
-      function savePreference() {
-        preferredName = newName;
-        pi.appendEntry("link-name", { name: preferredName });
-      }
-
-      if (newName === terminalName) {
-        savePreference();
-        _ctx.ui.notify(`Saved "${newName}" as preferred link name`, "info");
-        return;
-      }
-
-      // If we're the hub, check uniqueness before persisting
-      if (role === "hub") {
-        const takenByOther = Array.from(hubClients.values()).includes(newName);
-        if (takenByOther) {
-          _ctx.ui.notify(
-            `Name "${newName}" is already taken by another terminal`,
-            "warning",
-          );
-          return;
-        }
-        const old = terminalName;
-        terminalName = newName;
-        const list = terminalList();
-        connectedTerminals = list;
-        updateStatus();
-        // Notify clients only — hub already updated local state
-        hubBroadcast(
-          { type: "terminal_left", name: old, terminals: list },
-          terminalName,
-        );
-        hubBroadcast(
-          {
-            type: "terminal_joined",
-            name: newName,
-            terminals: list,
-            cwd: currentCwd,
-            context: captureContext(),
-          },
-          terminalName,
-        );
-        pushStatus(true);
-        savePreference();
-        _ctx.ui.notify(`Renamed to "${newName}"`, "info");
-      } else if (role === "client") {
-        // Don't update terminalName here — welcome will assign authoritatively
-        // after reconnect. Hub may dedupe newName to newName-2 if taken.
-        savePreference();
-        pendingClientRename = true;
-        ws?.close();
-        _ctx.ui.notify(
-          `Reconnecting, requesting "${newName}" (hub may assign a different name if taken)...`,
-          "info",
-        );
-      } else {
-        savePreference();
-        terminalName = newName;
-        _ctx.ui.notify(`Name set to "${newName}" (not connected)`, "info");
-      }
+      const result = setLinkName(args);
+      _ctx.ui.notify(result.message, result.level);
     },
   });
 
   pi.registerCommand("link-disconnect", {
     description: "Disconnect from the link",
     handler: async (_args, _ctx) => {
-      pi.appendEntry("link-active", { active: false });
-      manuallyDisconnected = true;
-      if (role === "disconnected") {
-        // Nothing is established, but a startup or reconnect attempt may still be
-        // dialing or binding; persisted intent has to win over it too.
-        cancelConnectionAttempt();
-        _ctx.ui.notify("Link disconnected", "info");
-        return;
-      }
-      disconnect();
-      _ctx.ui.notify("Disconnected from link", "info");
+      _ctx.ui.notify(disconnectLink(), "info");
     },
   });
 
   pi.registerCommand("link-connect", {
     description: "Connect to the link",
     handler: async (_args, _ctx) => {
-      if (role !== "disconnected") {
-        _ctx.ui.notify(
-          `Already connected as "${terminalName}" (${role})`,
-          "info",
-        );
-        return;
-      }
-      pi.appendEntry("link-active", { active: true });
-      manuallyDisconnected = false;
-      await initialize();
+      _ctx.ui.notify(await connectLink(), "info");
     },
   });
 
