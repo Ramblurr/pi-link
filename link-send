@@ -1,0 +1,114 @@
+#!/usr/bin/env node
+
+const HUB_URL = "ws://127.0.0.1:9900";
+const CONNECT_TIMEOUT_MS = 5_000;
+
+function usage(exitCode = 0) {
+  const stream = exitCode === 0 ? process.stdout : process.stderr;
+  stream.write(
+    "Usage: ./link-send --from <name> --to <name|*> --trigger <message>\n",
+  );
+  process.exit(exitCode);
+}
+
+function fail(message) {
+  console.error(`link-send: ${message}`);
+  process.exit(1);
+}
+
+function normalizeName(value) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function parseArgs(args) {
+  const options = {};
+  for (let i = 0; i < args.length; i++) {
+    const argument = args[i];
+    if (argument === "--help" || argument === "-h") usage();
+    if (!["--from", "--to", "--trigger"].includes(argument)) {
+      fail(`unknown argument: ${argument}`);
+    }
+    if (Object.hasOwn(options, argument)) fail(`specified ${argument} more than once`);
+    if (i + 1 === args.length) fail(`${argument} requires a value`);
+    options[argument] = args[++i];
+  }
+
+  for (const option of ["--from", "--to", "--trigger"]) {
+    if (!Object.hasOwn(options, option)) fail(`missing required ${option}`);
+  }
+
+  const from = normalizeName(options["--from"]);
+  const to = normalizeName(options["--to"]);
+  if (!from) fail("--from must not be empty");
+  if (!to) fail("--to must not be empty");
+  if (to === from) fail("--to cannot equal --from");
+
+  return { from, to, message: options["--trigger"] };
+}
+
+const { from, to, message } = parseArgs(process.argv.slice(2));
+const socket = new WebSocket(HUB_URL);
+let done = false;
+let welcomed = false;
+const timeout = setTimeout(() => finish(`timed out connecting to ${HUB_URL}`), CONNECT_TIMEOUT_MS);
+
+function finish(error) {
+  if (done) return;
+  done = true;
+  clearTimeout(timeout);
+  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    socket.close();
+  }
+  if (error) {
+    console.error(`link-send: ${error}`);
+    process.exitCode = 1;
+  }
+}
+
+socket.addEventListener("open", () => {
+  socket.send(JSON.stringify({ type: "register", name: from }));
+});
+
+socket.addEventListener("message", ({ data }) => {
+  let event;
+  try {
+    event = JSON.parse(String(data));
+  } catch {
+    return;
+  }
+
+  if (event.type === "error") {
+    finish(event.message);
+    return;
+  }
+  if (event.type !== "welcome" || welcomed) return;
+  welcomed = true;
+
+  if (event.name !== from) {
+    finish(`name ${JSON.stringify(from)} is already in use (assigned ${JSON.stringify(event.name)})`);
+    return;
+  }
+  if (to !== "*" && !event.terminals?.includes(to)) {
+    finish(`terminal ${JSON.stringify(to)} not found`);
+    return;
+  }
+
+  socket.send(
+    JSON.stringify({
+      type: "chat",
+      to,
+      content: message,
+      triggerTurn: true,
+    }),
+  );
+  console.log(`Triggered ${to === "*" ? "all terminals" : JSON.stringify(to)} from ${JSON.stringify(from)}`);
+  finish();
+});
+
+socket.addEventListener("error", () => {
+  if (!welcomed) finish(`could not connect to Pi Link hub at ${HUB_URL}`);
+});
+
+socket.addEventListener("close", () => {
+  if (!done) finish(`connection to Pi Link hub at ${HUB_URL} closed unexpectedly`);
+});

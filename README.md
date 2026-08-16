@@ -87,6 +87,23 @@ pi-link builder              # same, plus resume that session by name later (nee
 
 Already in a session? Use `/link-connect`. Use `/link` any time to check status, or let the LLM tools handle cross-terminal coordination. See [Session Resume](#session-resume) for `pi-link <name>` details.
 
+### One-shot trigger
+
+> [!NOTE]
+`link-send` requires Node.js 22 or newer for its built-in WebSocket client.
+
+From this repository (or the installed package directory), trigger a connected terminal without starting Pi:
+
+```bash
+./link-send --from qux-baz --to foo-bar --trigger "msg here"
+```
+
+The script connects to the existing local hub as `qux-baz`, sends a chat message to `foo-bar`, then disconnects. It fails if the requested source name is already in use or the target is not connected in the same group.
+
+### Notes on installation
+
+**Why two installs?** Pi 0.75 installs Pi packages into a private npm root (`~/.pi/agent/npm/`) for safer permission handling ([pi-mono#4587](https://github.com/earendil-works/pi-mono/issues/4587)). That's where the Pi extension lives, but it means the `pi-link` shell command is no longer on system PATH. `npm i -g pi-link` puts it on PATH separately. Both installs are safe to use together.
+
 ---
 
 ## Walkthrough

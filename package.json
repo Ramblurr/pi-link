@@ -13,7 +13,8 @@
     "index.ts",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "link-send"
   ],
   "repository": {
     "type": "git",
