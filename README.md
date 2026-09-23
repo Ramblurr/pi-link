@@ -764,6 +764,19 @@ What a failure hides is the ending, not the failure itself. A remote compaction 
 
 Those 300 seconds are two independent timers, not one synchronized deadline: the caller's bounded wait uses `COMPACT_TIMEOUT_MS` to stop waiting, and the local gate backstop reuses the same constant only to avoid inventing a second one. Aborting the caller before the request goes out leaves the target untouched; aborting after it goes out stops the caller from waiting and nothing else — the target's compaction, once started, runs to its own end.
 
+### Manual lifecycle validation
+
+Validate with real Pi terminals in tmux; this project has no automated test harness.
+
+1. Start a hub and two clients with Pi 0.87.1+, explicitly loading the candidate extension with `--no-extensions -e <candidate>`. Use test identities and an isolated port if another Link hub is running; do not disturb existing sessions.
+2. Subscribe before dispatch. Check missing and ordinary callbacks, duplicate registration, unsubscribe, disconnect/reconnect, and both hub/client subscribers. An already idle peer must not notify on registration. Verify out-of-group peers cannot be listed or subscribed to.
+3. Keep the subscriber in a bounded tool call while the worker finishes: the event should steer that run. In a separate stale-notice check, start another worker run while the subscriber is still in its bounded tool call. After that tool finishes, verify the earlier idle notice is absent from the subscriber's model context. The raw transcript can still show a notice filtered out of model context.
+4. Queue another assignment while the worker is busy. Check that idle is reported only after the queued work finishes.
+5. In a **throwaway worker project**, enable automatic compaction with a low threshold using `.pi/settings.json`: choose `reserveTokens` so `contextWindow - reserveTokens` is below the planned read workload, and lower `keepRecentTokens`. For a 272,000-token model, `reserveTokens: 260000` and `keepRecentTokens: 1000` suffice. Override that model's `compaction.modelOverrides` entry too if user settings already define one. Read enough source to cross the threshold and verify successful automatic compaction, continued work, and no transient idle notification. Check the worker's status with `/link` during compaction.
+6. Repeat short assignments whose last action sends a callback, then ends the run. Verify every callback and settled-idle event is processed; a separate idle turn after an already-finished callback run is acceptable.
+
+Save session transcripts and observed outcomes, including unexercised paths. Manual timing does not deterministically force the exact scheduler interleaving between a final queue check and settlement; do not claim exhaustive race coverage. Shut down test terminals and discard their temporary settings after validation.
+
 ### Rendering
 
 Delivered link batches render with a styled `⚡ [link]` prefix using the theme's accent color; sender attribution lives in the `From "name":` blocks inside the message body, not in the prefix. The link status text in Pi's footer uses `theme.fg("dim", ...)` to match Pi's standard footer styling.
