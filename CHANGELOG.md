@@ -6,6 +6,19 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## Unreleased
+
+### Added
+
+- `link_subscribe` and `link_unsubscribe` register for same-group peer `idle` and `disconnected` events without waiting. `link_send.subscribe` registers before dispatching work.
+- Lifecycle notifications steer a busy subscriber or wake an idle one. Subscriptions are connection/session-local and do not replace task callbacks.
+
+### Changed
+
+- Settled-idle reporting and lifecycle delivery require Pi 0.87.1+. Idle subscriptions ignore unmarked status reports from older Link peers.
+
+---
+
 ## 0.5.2 — 2026-09-29
 
 ### Fixed

@@ -6,7 +6,7 @@
  * First terminal to connect becomes the hub; others join as clients.
  * Hub loss triggers automatic promotion of a surviving client.
  *
- * Tools: link_send, link_list, link_compact
+ * Tools: link_control, link_send, link_subscribe, link_unsubscribe, link_list, link_compact
  * Commands: /link, /link-name, /link-connect, /link-disconnect
  */
 
@@ -28,11 +28,9 @@ import { WebSocket, WebSocketServer } from "ws";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-// Pi 0.84.2 is the floor: `agent_settled` and `ctx.isIdle()` are the whole basis of
-// the settled lifecycle and the remote-compaction guard below, and there is one code
-// path for them. Package installation does not check the host version, so an older
-// Pi installs pi-link successfully and must be refused at load.
-const MIN_PI_VERSION = [0, 84, 2];
+// Lifecycle subscriptions need Pi's settled boundary and reliable steering across
+// that boundary. Refuse older hosts rather than silently missing idle events.
+const MIN_PI_VERSION = [0, 87, 1];
 
 const DEFAULT_PORT = 9900;
 const COMPACT_TIMEOUT_MS = 300_000;
@@ -49,6 +47,8 @@ const PREVIEW_ROWS = 6;
 // ignored by Pi, whose ToolDefinition has no such field.
 const TOP_LEVEL_TOOL = { loadMode: "essential" } as const;
 const linkControlActions = ["connect", "disconnect"] as const;
+const lifecycleEvents = ["idle", "disconnected"] as const;
+type LifecycleEvent = (typeof lifecycleEvents)[number];
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -113,7 +113,7 @@ interface CompactResponseMsg {
 }
 
 type LinkStatus =
-  | { kind: "idle"; since: number }
+  | { kind: "idle"; since: number; settled?: true }
   | { kind: "thinking"; since: number }
   | { kind: "compacting"; since: number }
   | { kind: "tool"; toolName: string; since: number };
@@ -286,6 +286,29 @@ export default function (pi: ExtensionAPI) {
   const inbox: { from: string; content: string }[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Subscriptions belong to this connection, never to a reusable peer name.
+  const subscriptions = new Map<string, Set<LifecycleEvent>>();
+  const lifecycleNotices = new Map<
+    string,
+    {
+      from: string;
+      event: LifecycleEvent;
+      status?: LinkStatus;
+    }
+  >();
+  let lifecycleTimer: ReturnType<typeof setTimeout> | null = null;
+  let settledTimer: ReturnType<typeof setTimeout> | null = null;
+  // Idle notices handed to Pi's steering queue can still become stale before
+  // the next model request. Filter only their first context projection.
+  const pendingIdleNotices = new Map<
+    string,
+    {
+      from: string;
+      since: number;
+      subscription: Set<LifecycleEvent>;
+      discarded?: boolean;
+    }
+  >();
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   function getUi() {
@@ -318,16 +341,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   function deriveStatus(): LinkStatus {
-    // Highest precedence, so that reporting "compacting" and deferring delivery are
-    // the same condition rather than two that can disagree. In reachable states it
-    // competes only with "idle" — a compaction runs with no tool and no agent run —
-    // but where it could overlap, the gate is the more actionable fact: work sent
-    // here waits, and link_compact declines.
+    // The compaction gate takes precedence over delivery and status alike.
     if (compactionGated()) return { kind: "compacting", since: stateSince };
     const tool = displayedTool();
     if (tool) return { kind: "tool", toolName: tool, since: stateSince };
-    if (agentRunning) return { kind: "thinking", since: stateSince };
-    return { kind: "idle", since: stateSince };
+    if (agentRunning || inbox.length > 0)
+      return { kind: "thinking", since: stateSince };
+    return { kind: "idle", since: stateSince, settled: true };
   }
 
   /**
@@ -572,6 +592,8 @@ export default function (pi: ExtensionAPI) {
    * returns without rescheduling, and strands the inbox with no release left.
    */
   function releaseInbox() {
+    if (!compactionGated() && lifecycleNotices.size > 0)
+      scheduleLifecycleNotices();
     if (!localCompacting && !compactRunning && inbox.length > 0) {
       scheduleFlush(FLUSH_DELAY_MS);
     }
@@ -599,6 +621,116 @@ export default function (pi: ExtensionAPI) {
     // Release drains; it never polls. Nothing else wakes a waiting inbox.
     if (!on) releaseInbox();
     syncCompactionStatus();
+  }
+
+  // ── Lifecycle subscriptions ────────────────────────────────────────────
+
+  function clearSubscriptions() {
+    subscriptions.clear();
+    lifecycleNotices.clear();
+    if (lifecycleTimer) clearTimeout(lifecycleTimer);
+    lifecycleTimer = null;
+  }
+
+  function queueLifecycleNotice(
+    from: string,
+    event: LifecycleEvent,
+    status?: LinkStatus,
+  ) {
+    lifecycleNotices.set(`${from}:${event}`, { from, event, status });
+    scheduleLifecycleNotices();
+  }
+
+  function scheduleLifecycleNotices() {
+    if (lifecycleTimer) return;
+    // Defer one macrotask so a resumed worker can invalidate an unsent idle notice.
+    lifecycleTimer = setTimeout(() => {
+      lifecycleTimer = null;
+      // Like chat, lifecycle delivery must not start a run during manual compaction.
+      if (compactionGated()) return;
+      const notices = [...lifecycleNotices.values()];
+      lifecycleNotices.clear();
+      if (!isRuntimeLive()) return;
+      for (const notice of notices) {
+        const lifecycleId = crypto.randomUUID();
+        if (notice.event === "idle") {
+          const subscription = subscriptions.get(notice.from);
+          const status = getStatusFor(notice.from);
+          if (
+            !subscription?.has("idle") ||
+            status?.kind !== "idle" ||
+            status.since !== notice.status?.since
+          )
+            continue;
+          pendingIdleNotices.set(lifecycleId, {
+            from: notice.from,
+            since: status.since,
+            subscription,
+          });
+        }
+        pi.sendMessage(
+          {
+            customType: "link",
+            content:
+              notice.event === "idle"
+                ? `[Link lifecycle] "${notice.from}" became idle. Idle does not imply task completion. Reconcile outstanding callbacks and legitimate waits before intervening.`
+                : `[Link lifecycle] "${notice.from}" disconnected from Link. The cause is unknown; its subscriptions have been removed.`,
+            display: true,
+            details: { from: notice.from, event: notice.event, lifecycleId },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      }
+    }, 0);
+  }
+
+  function observeStatus(name: string, status: LinkStatus) {
+    const previous = terminalStatuses.get(name);
+    terminalStatuses.set(name, status);
+    if (status.kind !== "idle") lifecycleNotices.delete(`${name}:idle`);
+    if (
+      status.kind === "idle" &&
+      status.settled &&
+      previous &&
+      previous.kind !== "idle" &&
+      subscriptions.get(name)?.has("idle")
+    ) {
+      queueLifecycleNotice(name, "idle", status);
+    }
+  }
+
+  function peerLeft(name: string) {
+    lifecycleNotices.delete(`${name}:idle`);
+    if (subscriptions.get(name)?.has("disconnected")) {
+      queueLifecycleNotice(name, "disconnected");
+    }
+    subscriptions.delete(name);
+  }
+
+  function addSubscriptions(to: string, events: readonly LifecycleEvent[]) {
+    if (events.length === 0) return;
+    const current = subscriptions.get(to) ?? new Set<LifecycleEvent>();
+    for (const event of events) current.add(event);
+    subscriptions.set(to, current);
+  }
+
+  function validateSubscription(to: string, events: readonly string[]) {
+    if (role === "disconnected") return notConnectedResult();
+    if (to === "*" || to === terminalName) {
+      return textResult("Subscriptions require one other named terminal", {
+        to,
+        error: "invalid_target",
+      });
+    }
+    if (
+      events.some((event) => !lifecycleEvents.includes(event as LifecycleEvent))
+    ) {
+      return textResult("Supported events: idle, disconnected", {
+        to,
+        error: "invalid_event",
+      });
+    }
+    return targetNotFound(to);
   }
 
   // ── Connection intent ──────────────────────────────────────────────────
@@ -818,6 +950,7 @@ export default function (pi: ExtensionAPI) {
 
       case "terminal_left":
         connectedTerminals = msg.terminals;
+        peerLeft(msg.name);
         terminalStatuses.delete(msg.name);
         terminalCwds.delete(msg.name);
         terminalContexts.delete(msg.name);
@@ -840,14 +973,16 @@ export default function (pi: ExtensionAPI) {
 
       // ── Status update from another terminal ──
       case "status_update":
-        terminalStatuses.set(msg.name, msg.status);
+        observeStatus(msg.name, msg.status);
         if (msg.context) terminalContexts.set(msg.name, msg.context);
         else if (msg.context === null) terminalContexts.delete(msg.name);
         break;
 
       // ── Chat message ──
       case "chat":
+        if (!agentRunning && inbox.length === 0) stateSince = Date.now();
         inbox.push({ from: msg.from, content: msg.content });
+        pushStatus();
         scheduleFlush(FLUSH_DELAY_MS);
         break;
 
@@ -1185,10 +1320,10 @@ export default function (pi: ExtensionAPI) {
         if (ws !== socket) return; // a stale socket owns none of the state below
         ws = null;
         if (disposed) return;
+        clearSubscriptions();
         role = "disconnected";
         connectedTerminals = [];
-        // Drop this connection's snapshots: a reconnect — or a promotion to hub —
-        // must not serve metadata from the network that just went away.
+        // Drop snapshots with the connection, including on hub promotion.
         terminalStatuses.clear();
         terminalCwds.clear();
         terminalContexts.clear();
@@ -1323,6 +1458,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const old = terminalName;
+      if (groupOf(old) !== groupOf(newName)) clearSubscriptions();
       terminalName = newName;
       const list = terminalList();
       connectedTerminals = list;
@@ -1399,8 +1535,10 @@ export default function (pi: ExtensionAPI) {
   // ── Cleanup ──────────────────────────────────────────────────────────────
 
   function disconnect() {
-    // Cancel establishment first, so nothing in flight can commit state behind us.
-    // This also clears the reconnect and startup timers.
+    clearSubscriptions();
+    if (settledTimer) clearTimeout(settledTimer);
+    settledTimer = null;
+    // Cancel establishment before an in-flight transport can commit state.
     cancelConnectionAttempt();
 
     // Clear link-owned remote compaction state; a local /compact survives disconnect.
@@ -1461,6 +1599,8 @@ export default function (pi: ExtensionAPI) {
   // ── Lifecycle events ─────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, _ctx) => {
+    clearSubscriptions();
+    pendingIdleNotices.clear();
     ctx = _ctx;
     currentCwd = _ctx.cwd;
 
@@ -1524,6 +1664,39 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (flagName || shouldConnect()) scheduleStartupConnect();
+  });
+
+  pi.on("context", (event) => ({
+    messages: event.messages.filter((message) => {
+      if (message.role !== "custom" || message.customType !== "link")
+        return true;
+      const id = (message.details as { lifecycleId?: string } | undefined)
+        ?.lifecycleId;
+      const pending = id ? pendingIdleNotices.get(id) : undefined;
+      if (!pending || !id) return true;
+      const status = getStatusFor(pending.from);
+      const valid =
+        !pending.discarded &&
+        status?.kind === "idle" &&
+        status.since === pending.since &&
+        subscriptions.get(pending.from) === pending.subscription &&
+        pending.subscription.has("idle");
+      if (valid) pendingIdleNotices.delete(id);
+      else pending.discarded = true; // keep stale entries out of later projections too
+      return valid;
+    }),
+  }));
+
+  pi.on("session_switch", (_event, newContext) => {
+    clearSubscriptions();
+    pendingIdleNotices.clear();
+    ctx = newContext;
+  });
+
+  pi.on("session_fork", (_event, newContext) => {
+    clearSubscriptions();
+    pendingIdleNotices.clear();
+    ctx = newContext;
   });
 
   pi.on("session_shutdown", async () => {
@@ -1604,17 +1777,19 @@ export default function (pi: ExtensionAPI) {
     pushStatus();
   });
 
-  pi.on("agent_settled", async (_event, settledCtx) => {
-    // The authoritative end of a run: Pi emits this once no retry, compaction or
-    // queued continuation is left. It can still be followed immediately by a new run
-    // another extension started during settlement, whose agent_start already set the
-    // flag we would be clearing — so ask Pi instead of assuming, and leave a newer
-    // run reporting thinking.
-    if (!settledCtx.isIdle()) return;
-    const before = statusIdentity(deriveStatus());
-    agentRunning = false;
-    if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
-    pushStatus();
+  pi.on("agent_settled", () => {
+    // Wait until all settlement handlers finish, then ask Pi whether another run
+    // began before clearing the busy flag. Never publish agent_end as idle.
+    if (settledTimer) clearTimeout(settledTimer);
+    settledTimer = setTimeout(() => {
+      settledTimer = null;
+      if (!isRuntimeLive() || !ctx?.isIdle() || ctx.hasPendingMessages())
+        return;
+      const before = statusIdentity(deriveStatus());
+      agentRunning = false;
+      if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
+      pushStatus();
+    }, 0);
   });
 
   // ── Tool helpers ──────────────────────────────────────────────────────────
@@ -1636,9 +1811,7 @@ export default function (pi: ExtensionAPI) {
   function truncatePreview(text: string, dim: (text: string) => string) {
     const preview = text.replace(/\s+/g, " ");
     return preview.length > 60
-      ? dim(preview.slice(0, 60) + "... (") +
-          expansionHint(dim) +
-          dim(")")
+      ? dim(preview.slice(0, 60) + "... (") + expansionHint(dim) + dim(")")
       : dim(preview);
   }
 
@@ -1721,6 +1894,49 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  for (const action of ["subscribe", "unsubscribe"] as const) {
+    pi.registerTool({
+      ...TOP_LEVEL_TOOL,
+      name: `link_${action}`,
+      label: action === "subscribe" ? "Link Subscribe" : "Link Unsubscribe",
+      description:
+        action === "subscribe"
+          ? "Register for a peer's idle or disconnected events without waiting. Events steer you while busy or wake you while idle. Persists until removed or disconnected; idle does not mean task completion."
+          : "Stop receiving one lifecycle event from a peer. Removing an absent subscription is harmless.",
+      parameters: Type.Object({
+        to: Type.String({ description: "One other connected terminal name" }),
+        event: StringEnum(lifecycleEvents),
+      }),
+      async execute(_toolCallId, params) {
+        const error = validateSubscription(params.to, [params.event]);
+        if (error) return error;
+        if (action === "subscribe") {
+          addSubscriptions(params.to, [params.event]);
+        } else {
+          const current = subscriptions.get(params.to);
+          current?.delete(params.event);
+          if (current?.size === 0) subscriptions.delete(params.to);
+          lifecycleNotices.delete(`${params.to}:${params.event}`);
+          if (params.event === "idle") {
+            for (const pending of pendingIdleNotices.values()) {
+              if (pending.from === params.to) pending.discarded = true;
+            }
+          }
+        }
+        return textResult(
+          `${action === "subscribe" ? "Subscribed to" : "Unsubscribed from"} "${params.to}" ${params.event}`,
+          {
+            to: params.to,
+            event: params.event,
+            subscriptions: [...(subscriptions.get(params.to) ?? [])],
+          },
+        );
+      },
+      renderResult: (result, _options, theme) =>
+        renderIconResult(result, theme),
+    });
+  }
+
   pi.registerTool({
     ...TOP_LEVEL_TOOL,
     name: "link_send",
@@ -1728,12 +1944,19 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Send a message to one other Pi terminal on the link.",
       "The message always acts: it steers a busy receiver at its next safe boundary, or starts a turn on an idle one.",
+      "Optionally subscribe to idle/disconnected events from the recipient before dispatch. Subscriptions persist until removed or disconnected.",
     ].join(" "),
     promptSnippet:
       "Send a message to another Pi terminal on the local link network",
     parameters: Type.Object({
       to: Type.String({ description: "Target terminal name" }),
       message: Type.String({ description: "Message content" }),
+      subscribe: Type.Optional(
+        Type.Array(StringEnum(lifecycleEvents), {
+          description:
+            "Register the sender for these recipient events before sending (idle, disconnected)",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params) {
@@ -1748,15 +1971,38 @@ export default function (pi: ExtensionAPI) {
       const miss = targetNotFound(params.to);
       if (miss) return miss;
 
-      const delivered = routeMessage({
-        type: "chat",
-        from: terminalName,
-        to: params.to,
-        content: params.message,
-      });
+      const events = params.subscribe ?? [];
+      if (events.length > 0) {
+        const error = validateSubscription(params.to, events);
+        if (error) return error;
+      }
+      const previous = subscriptions.get(params.to);
+      const saved = previous ? new Set(previous) : undefined;
+      addSubscriptions(params.to, events);
+      const rollback = () => {
+        if (previous && saved) {
+          previous.clear();
+          for (const event of saved) previous.add(event);
+          subscriptions.set(params.to, previous);
+        } else subscriptions.delete(params.to);
+      };
+
+      let delivered: boolean;
+      try {
+        delivered = routeMessage({
+          type: "chat",
+          from: terminalName,
+          to: params.to,
+          content: params.message,
+        });
+      } catch (error) {
+        rollback();
+        throw error;
+      }
 
       const target = `"${params.to}"`;
       if (!delivered) {
+        rollback();
         return textResult(`Failed to send to ${target}`, {
           to: params.to,
           error: "not_delivered",
@@ -1764,7 +2010,14 @@ export default function (pi: ExtensionAPI) {
       }
       // Hub delivery is authoritative; client delivery is optimistic (hub routes)
       const verb = role === "hub" ? "Sent to" : "Sent to hub for delivery to";
-      return textResult(`${verb} ${target}`, { to: params.to });
+      const subscriptionText =
+        events.length > 0
+          ? `; subscribed to ${[...new Set(events)].join(", ")}`
+          : "";
+      return textResult(`${verb} ${target}${subscriptionText}`, {
+        to: params.to,
+        subscriptions: [...(subscriptions.get(params.to) ?? [])],
+      });
     },
 
     renderCall(args, theme, context) {
@@ -1903,7 +2156,8 @@ export default function (pi: ExtensionAPI) {
     ...TOP_LEVEL_TOOL,
     name: "link_list",
     label: "Link List",
-    description: "List the Pi terminals in your group currently connected to the link.",
+    description:
+      "List the Pi terminals in your group currently connected to the link.",
     promptSnippet: "List connected Pi terminals in your group",
     parameters: Type.Object({}),
 
@@ -2041,7 +2295,9 @@ export default function (pi: ExtensionAPI) {
     // The same panel Pi draws around extension messages by default: returning our own
     // component bypasses the host's box, so a link message would otherwise sit unframed
     // among framed ones. `outputPad` is the user's configured output padding.
-    const box = new Box(options.outputPad, 1, (t) => theme.bg("customMessageBg", t));
+    const box = new Box(options.outputPad, 1, (t) =>
+      theme.bg("customMessageBg", t),
+    );
     box.addChild(
       options.expanded
         ? content

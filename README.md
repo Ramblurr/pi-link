@@ -31,7 +31,7 @@ Questions, ideas? There's a [pi-link thread](https://discord.com/channels/145680
 
 ## Prerequisites
 
-- [Pi coding agent](https://github.com/badlogic/pi-mono), version **0.84.2 or later** (for pi-link 0.3+), stable releases only, reported as `x.y.z` without a prerelease or build suffix. On Pi 0.74–0.84.1, pin `pi-link@0.2.x`; on Pi ≤0.73, pin `pi-link@0.1.14`.
+- [Pi coding agent](https://github.com/earendil-works/pi-mono), version **0.87.1 or later** for lifecycle subscriptions and settled-idle reporting, stable `x.y.z` releases only (no prerelease or build suffix).
 - Node.js (LTS recommended)
 
 Pi's package installation does not check the host version, so `pi install` succeeds on an older Pi. pi-link then refuses to initialize instead of half-running: it throws before registering anything, and Pi reports it under **[Extension issues]** with the required minimum and the version it detected.
@@ -163,6 +163,8 @@ Three tools: `link_send` to talk to another terminal, `link_list` to see who is 
 | `link_send`    | Send a message to one other terminal                    | Reports whether sending started, not whether it arrived |
 | `link_list`    | List currently connected terminals                      | Terminal list with roles, status, cwd, and context      |
 | `link_compact` | Ask another terminal to compact and wait for its result | Compacted, declined, or failed                          |
+| `link_subscribe` | Register for peer idle/disconnected events | Immediate subscription state; does not wait |
+| `link_unsubscribe` | Remove a lifecycle subscription | Immediate subscription state |
 
 ### `link_control`
 
@@ -182,6 +184,7 @@ Send a message to one other terminal. The sender returns immediately.
 | --------- | -------- | -------------------- |
 | `to`      | `string` | Target terminal name |
 | `message` | `string` | Message content      |
+| `subscribe` | `("idle" \| "disconnected")[]` | Optional recipient events to register before dispatch |
 
 When a message reaches the target terminal, it enters the receiver's inbox. Messages arriving close together are usually delivered as one batch, in arrival order, each batch one `[Link: N message(s) received]` block, with every message under a `From "name":` header. The batching window, the size caps that can split a batch and what can hold one back are in [Inbox](#inbox).
 
@@ -190,6 +193,35 @@ The receiver's state is read when that batch is delivered, not when it is sent. 
 Each send has exactly one recipient; there is no fan-out.
 
 Targets are pre-validated against the terminals in your group, so a definite typo, an offline name and a name outside your group all fail the same way. Sending to yourself is rejected. For a client, a successful send means the message was handed to its connection to the hub. It does not confirm that the hub routed it or that the receiver saw it — see [Message Routing](#message-routing--error-handling). A reply, when one comes, is an ordinary later `link_send` from the other side; nothing correlates it to your message or produces it automatically.
+
+### `link_subscribe` / `link_unsubscribe`
+
+Register or remove one lifecycle subscription without waiting for an event.
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `to` | `string` | One other connected terminal in your group; no self or broadcast targets |
+| `event` | `"idle" \| "disconnected"` | Event to add or remove |
+
+```typescript
+link_send({
+  to: "dev@project",
+  message: "Implement the ticket and report DONE or BLOCKED.",
+  subscribe: ["idle", "disconnected"],
+});
+link_subscribe({ to: "reviewer@project", event: "idle" });
+link_unsubscribe({ to: "reviewer@project", event: "idle" });
+```
+
+- `idle`: a busy peer becomes settled idle, after retries, automatic compaction and queued work. Initial idle snapshots and repeated idle reports do not notify. Both peers must use this version of Link; older peers' unmarked idle reports are ignored.
+- `disconnected`: Link observed the peer leave, not proof of exit, crash, or task failure.
+- `[Link lifecycle]` events steer busy subscribers or start a turn when idle. Like chat, delivery waits during manual compaction. Stale idle notices are filtered before their first model request if the peer resumes.
+- Subscriptions persist across sends and events. Registration is idempotent; removing an absent event on a connected peer is harmless. Results include the peer's remaining subscriptions.
+- `link_send.subscribe` registers before dispatch; invalid requests send nothing. Locally failed sends roll back additions. Client send success still means sent to the hub, not acknowledged by the recipient.
+- Subscriptions are connection/session-local. Peer departure removes its subscriptions. Subscriber disconnect, session switch/fork, shutdown, or a hub rename changing group clears them. Reconnects and same-name replacements do not restore them. Hub loss clears subscriptions without replay or guaranteed disconnect notifications.
+- Callbacks never suppress lifecycle events: a callback run that already finished can be followed by another turn.
+
+Idle is **not completion**. Reconcile outstanding callbacks: accepted completion needs no action, legitimate reviewer or coordination waits remain undisturbed, and missing callbacks warrant investigation. Directed supervisor-to-worker subscriptions avoid mutual wake-up loops.
 
 ### `link_list`
 
@@ -686,13 +718,15 @@ The extension hooks into Pi's agent lifecycle events:
 
 - **`agent_start`** → Sets `agentRunning = true`, which drives status. Clears the local compaction gate (`localCompacting`, never a remote request's `compactRunning`) - safe only under the current deployment, not by Pi alone: Pi refuses to start an ordinary prompt during a manual compaction, and pi-link holds back the one delivery path that refusal does not cover, so nothing can start a run mid-compaction. Another extension starting a turn during one would void that. Status normally becomes `thinking`.
 - **`agent_end`** → Drops any tool calls still recorded, so an unmatched one falls back to `thinking` instead of staying pinned. It deliberately does **not** end the run: Pi may still retry, compact automatically, or drain a queued continuation, so the status stays `thinking`.
-- **`agent_settled`** → The authoritative end of a run: Pi emits it once no retry, compaction or queued continuation is left. Status becomes `idle` — unless the event's context reports Pi busy again, which means another extension started a new run during settlement, and that newer run keeps reporting `thinking`.
+- **`agent_settled`** → Defers status publication until settlement handlers finish, then checks Pi is idle with no pending messages. Idle requires an empty chat inbox and no compaction gate; a new run started during settlement keeps reporting busy.
 - **`tool_execution_start`** → Records that call. It is displayed unless an earlier call is still running.
 - **`tool_execution_end`** → Drops that one call. The display stays `tool:<name>` while other calls remain, moves to the next call when the displayed one ends, and returns to `thinking` after the last one while the agent run continues.
 - **`session_before_compact`** → For a manual compaction, raises the gate that holds inbox delivery. Automatic (threshold/overflow) compaction is left alone: it runs inside the agent run, where Pi already queues and drains steered messages itself.
 - **`session_compact`** → Clears the local compaction gate and force-pushes a `status_update` so peers see the new (post-compaction) context usage immediately.
 - **`model_select`** → Force-pushes a `status_update`: the context window, and so the usage percentage, belongs to the model.
 - **`session_tree`** → Force-pushes a `status_update`: context usage belongs to the active branch.
+- **`context`** → Filters idle notifications that became stale while waiting in Pi's steering queue, before their first model request.
+- **`session_switch` / `session_fork`** → Clear connection/session-local subscriptions.
 - **`session_shutdown`** → Full cleanup via `cleanup()`: closes all sockets, resolves pending promises, and disposes the extension.
 
 The five agent and tool handlers — `agent_start`, `agent_end`, `agent_settled` (when Pi still reports the session idle), `tool_execution_start` and `tool_execution_end` — each recompute the status and hand it to `pushStatus()`, which publishes only when the display identity changed since the last publish: a second concurrent tool starting behind the one already shown is silent, and so is a mutation that leaves a raised compaction gate on display. The session handlers keep the separate paths described in their own bullets, and `session_shutdown` cleans up rather than pushing. `disconnect()` is the only thing that clears the stored baseline, and `pushStatus()` returns immediately while the terminal is disconnected, so handler events in that interval restore nothing; once connected again, either a client's forced `welcome` push or the first of those ordinary handler events restores it. `session_compact`, `model_select` and `session_tree` always push, whether the identity changed or not — including while a remote request's gate still holds the displayed identity.

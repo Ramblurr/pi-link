@@ -13,6 +13,11 @@ description: "How `link_send`, `link_list` and `link_compact` behave between Pi 
 
 ## Tools
 
+### `link_control`
+
+- `connect` requires `name` and connects or renames this terminal. Names determine groups.
+- `disconnect` closes this terminal's link and disables automatic reconnect.
+
 ### `link_list`
 
 - Returns connected terminals with names, status (`idle`, `thinking`, `compacting`, `tool:<name>`), cwd, and (when available) context usage such as `45K/272K (17%)`.
@@ -31,6 +36,17 @@ description: "How `link_send`, `link_list` and `link_compact` behave between Pi 
 - A delivered message always enters the receiver's reasoning: if the receiver is idle it starts a turn; if it is running, the batch is steered into that run at Pi's next safe boundary — current tool calls finish first, before the next LLM call. The receiver's state is read when the batch is delivered, not when you send and not when you last ran `link_list`.
 - Each call has one recipient; there is no broadcast.
 - The call returns send status, not the receiver's eventual work result. A target absent from your local, group-filtered list — a typo, an offline terminal or a name in another group — fails immediately; the error lists the names currently visible to you. A successful send means the message was accepted for delivery, not that it arrived. For a client, if the target has vanished, the routing failure is shown to the human as a notification and never reaches the sending model. A terminal's queued messages are invisible to you, and silence alone does not tell you whether your message was received or acted on.
+
+### `link_subscribe` / `link_unsubscribe`
+
+- Register or remove `{ to, event }`, where `event` is `idle` or `disconnected`, for one other connected terminal in your group. Both return immediately. Registration is idempotent.
+- `link_send` can add `subscribe: ["idle", "disconnected"]` before dispatch. Invalid subscriptions send nothing; a locally failed send rolls back additions. Client send success is still not a delivery acknowledgement.
+- `idle` means a busy peer became settled idle after retries, automatic compaction and queued work. Initial snapshots and repeated idle reports do not notify. `disconnected` means Link observed a departure, not proof of task failure.
+- Events appear as `[Link lifecycle]`, steer you while busy, or start a turn when idle. Like chat, they wait during manual compaction. Stale idle events are filtered before their first model request if the peer resumes.
+- Subscriptions persist across sends and events. Unsubscribe removes one event. Peer departure removes its subscriptions; your disconnect, session switch/fork, shutdown or group change clears yours. Reconnects and same-name replacements do not restore them. Hub loss offers no replay or guaranteed disconnect notice.
+- Callbacks do not suppress lifecycle events; a callback run that already finished can be followed by another turn.
+- **Idle is not completion.** Reconcile outstanding callbacks. Accepted completion needs no action; legitimate reviewer/coordination waits remain undisturbed. Investigate unexplained missing callbacks. Prefer directed supervisor-to-worker subscriptions to avoid mutual wake-up loops.
+- Requires Pi 0.87.1+ and updated Link peers. Older peers' unmarked idle snapshots are ignored.
 
 ### `link_compact`
 
@@ -60,4 +76,4 @@ description: "How `link_send`, `link_list` and `link_compact` behave between Pi 
 - **Localhost only.** All terminals run on the same machine.
 - **Cwd is a hint, not proof.** Same cwd does not prove the same workspace, branch, or access. Paths named in a message are only text: they do not change the receiver's cwd, and relative commands resolve from the receiver's own cwd.
 - **Names are identities.** The hub suffixes collisions, so the name you remember may not be the name that is connected; `link_list` shows the current one.
-- **`@group` in a name limits your world.** The text after the first `@` is the group (case-sensitive): `link_list`, `link_send` and `link_compact` only see and reach terminals of your own group, and names without `@` form one group of their own. These tools cannot change your name or group; `/link-name` is the local command for changing them. Groups scope visibility and targeting, not authentication.
+- **`@group` in a name limits your world.** The text after the first `@` is the group (case-sensitive). Peer tools see and target only your own group; names without `@` form one group. Change name/group with `link_control` or `/link-name`. Groups scope visibility and targeting, not authentication.
